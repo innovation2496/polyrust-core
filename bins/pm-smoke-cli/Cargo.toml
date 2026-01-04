@@ -1,0 +1,29 @@
+[package]
+name = "pm-smoke-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Polymarket CLOB smoke test CLI"
+
+[[bin]]
+name = "pm_smoke"
+path = "src/main.rs"
+
+[dependencies]
+polymarket-adapter = { path = "../../crates/polymarket-adapter" }
+
+# CLI
+clap.workspace = true
+
+# Async
+tokio.workspace = true
+
+# Logging
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+# Error handling
+anyhow.workspace = true
+
+# Time
+chrono.workspace = true

@@ -1,0 +1,44 @@
+[package]
+name = "polymarket-adapter"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Polymarket CLOB adapter with dual backend support (httpws / rs-clob-client)"
+
+[features]
+default = ["httpws"]
+httpws = []
+rsclob = ["dep:polymarket-client-sdk"]
+
+[dependencies]
+# Error handling
+anyhow.workspace = true
+thiserror.workspace = true
+
+# Serialization
+serde.workspace = true
+serde_json.workspace = true
+
+# Logging
+tracing.workspace = true
+
+# Async
+tokio.workspace = true
+futures.workspace = true
+futures-util.workspace = true
+
+# HTTP (for httpws backend)
+reqwest.workspace = true
+
+# WebSocket (for httpws backend)
+tokio-tungstenite.workspace = true
+
+# URL
+url.workspace = true
+
+# Time
+chrono.workspace = true
+
+# Official Polymarket client (optional, for rsclob backend)
+# Pin to 0.3.x as per official repo
+polymarket-client-sdk = { workspace = true, optional = true }

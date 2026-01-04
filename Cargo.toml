@@ -1,0 +1,47 @@
+[workspace]
+resolver = "2"
+members = [
+  "crates/polymarket-adapter",
+  "bins/pm-smoke-cli",
+]
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
+version = "0.1.0"
+
+[workspace.dependencies]
+# Error handling
+anyhow = "1"
+thiserror = "2"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+
+# Async runtime
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "fs", "signal", "sync", "io-util"] }
+futures = "0.3"
+futures-util = "0.3"
+
+# HTTP client
+reqwest = { version = "0.12", default-features = false, features = ["json", "gzip", "rustls-tls"] }
+
+# WebSocket
+tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }
+
+# URL parsing
+url = "2"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Time
+chrono = { version = "0.4", features = ["serde"] }
+
+# Official Polymarket client (pinned version)
+polymarket-client-sdk = "0.3"
