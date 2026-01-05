@@ -187,17 +187,17 @@ pub struct BookMessage {
     pub asset_id: String,
     /// Condition ID
     pub market: String,
-    /// Unix timestamp in milliseconds
-    pub timestamp: i64,
+    /// Unix timestamp in milliseconds (as string from API)
+    pub timestamp: String,
     /// Orderbook content hash
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hash: Option<String>,
     /// Bid levels (price, size pairs)
     #[serde(default)]
-    pub buys: Vec<OrderSummary>,
+    pub bids: Vec<OrderSummary>,
     /// Ask levels (price, size pairs)
     #[serde(default)]
-    pub sells: Vec<OrderSummary>,
+    pub asks: Vec<OrderSummary>,
     /// Extra fields
     #[serde(flatten)]
     pub extra: Map<String, Value>,
@@ -227,8 +227,8 @@ pub struct PriceChangeEntry {
 pub struct PriceChangeMessage {
     /// Condition ID
     pub market: String,
-    /// Unix timestamp in milliseconds
-    pub timestamp: i64,
+    /// Unix timestamp in milliseconds (as string from API)
+    pub timestamp: String,
     /// Array of price changes
     #[serde(default)]
     pub price_changes: Vec<PriceChangeEntry>,
@@ -246,7 +246,7 @@ pub struct TickSizeChangeMessage {
     /// Condition ID
     pub market: String,
     /// Unix timestamp in milliseconds
-    pub timestamp: i64,
+    pub timestamp: String,
     /// Previous tick size
     pub old_tick_size: String,
     /// New tick size
@@ -268,7 +268,7 @@ pub struct LastTradePriceMessage {
     /// Condition ID
     pub market: String,
     /// Unix timestamp in milliseconds
-    pub timestamp: i64,
+    pub timestamp: String,
     /// Trade price
     pub price: String,
     /// Trade size
@@ -292,7 +292,7 @@ pub struct BestBidAskMessage {
     /// Condition ID
     pub market: String,
     /// Unix timestamp in milliseconds
-    pub timestamp: i64,
+    pub timestamp: String,
     /// Best bid price
     pub best_bid: String,
     /// Best ask price
@@ -770,14 +770,15 @@ mod tests {
 
     #[test]
     fn test_parse_book_message() {
+        // Note: Polymarket API returns timestamp as string and uses bids/asks
         let json = r#"{
             "event_type": "book",
             "asset_id": "token123",
             "market": "condition456",
-            "timestamp": 1704067200000,
+            "timestamp": "1704067200000",
             "hash": "abc123",
-            "buys": [{"price": "0.50", "size": "100"}],
-            "sells": [{"price": "0.51", "size": "200"}]
+            "bids": [{"price": "0.50", "size": "100"}],
+            "asks": [{"price": "0.51", "size": "200"}]
         }"#;
 
         let msg = WsInboundMessage::parse(json);
