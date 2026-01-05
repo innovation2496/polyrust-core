@@ -493,19 +493,45 @@ impl WsInboundMessage {
 // Source: https://docs.polymarket.com/developers/gamma-markets-api/gamma-structure
 // ============================================================================
 
-/// Deserialize a stringified JSON array with default empty vec
+/// Deserialize a stringified JSON array (e.g., "[\"a\", \"b\"]") into Vec<String>
+/// Handles both String and missing/null fields
 fn deserialize_stringified_array_or_default<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
-    use serde::de::Error;
-    let opt: Option<String> = serde::Deserialize::deserialize(deserializer)?;
-    match opt {
-        Some(s) if !s.is_empty() => {
-            serde_json::from_str(&s).map_err(|e| D::Error::custom(format!("Invalid JSON array: {}", e)))
+    use serde::de::{Error, Visitor};
+
+    struct StringifiedArrayVisitor;
+
+    impl<'de> Visitor<'de> for StringifiedArrayVisitor {
+        type Value = Vec<String>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+            formatter.write_str("a stringified JSON array or null")
         }
-        _ => Ok(Vec::new()),
+
+        fn visit_str<E: Error>(self, s: &str) -> Result<Self::Value, E> {
+            if s.is_empty() {
+                return Ok(Vec::new());
+            }
+            serde_json::from_str(s)
+                .map_err(|e| E::custom(format!("Invalid JSON array '{}': {}", s, e)))
+        }
+
+        fn visit_string<E: Error>(self, s: String) -> Result<Self::Value, E> {
+            self.visit_str(&s)
+        }
+
+        fn visit_none<E: Error>(self) -> Result<Self::Value, E> {
+            Ok(Vec::new())
+        }
+
+        fn visit_unit<E: Error>(self) -> Result<Self::Value, E> {
+            Ok(Vec::new())
+        }
     }
+
+    deserializer.deserialize_any(StringifiedArrayVisitor)
 }
 
 /// Gamma Market response from GET /markets or GET /markets/slug/{slug}
