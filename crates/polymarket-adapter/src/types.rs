@@ -275,9 +275,9 @@ pub struct LastTradePriceMessage {
     pub size: String,
     /// Trade side (BUY/SELL)
     pub side: String,
-    /// Fee rate in basis points
+    /// Fee rate in basis points (API returns as string)
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub fee_rate_bps: Option<i64>,
+    pub fee_rate_bps: Option<String>,
     /// Extra fields
     #[serde(flatten)]
     pub extra: Map<String, Value>,
