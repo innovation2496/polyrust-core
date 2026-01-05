@@ -17,7 +17,7 @@ use futures_util::{SinkExt, StreamExt};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::fs::File;
 use tokio::io::AsyncWriteExt;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
@@ -32,6 +32,15 @@ const MAX_BACKOFF_SECS: u64 = 30;
 
 /// Initial backoff interval
 const INITIAL_BACKOFF_SECS: u64 = 1;
+
+/// Flush file every N messages
+const FLUSH_EVERY_MSGS: u64 = 200;
+
+/// Flush file at least every N seconds
+const FLUSH_EVERY_SECS: u64 = 5;
+
+/// Log progress every N seconds
+const LOG_PROGRESS_EVERY_SECS: u64 = 60;
 
 /// User channel WebSocket client
 pub struct UserWsClient {
@@ -74,6 +83,13 @@ impl UserWsClient {
         let mut stats = MessageStats::new();
         let mut backoff_secs = INITIAL_BACKOFF_SECS;
         let mut total_collected: u64 = 0;
+        let mut reconnect_count: u64 = 0;
+
+        // Timing for periodic flush and progress logging
+        let start_time = Instant::now();
+        let mut last_flush = Instant::now();
+        let mut last_progress_log = Instant::now();
+        let mut last_flush_count: u64 = 0;
 
         // Create output file
         let mut file = File::create(output_path).await.context("Failed to create output file")?;
@@ -91,7 +107,23 @@ impl UserWsClient {
                         // Check limit
                         if limit > 0 && total_collected >= limit {
                             info!("Reached message limit: {}", limit);
+                            file.flush().await?;
                             return Ok(stats);
+                        }
+
+                        // Periodic progress logging (every 60s)
+                        if last_progress_log.elapsed() >= Duration::from_secs(LOG_PROGRESS_EVERY_SECS)
+                        {
+                            let uptime_secs = start_time.elapsed().as_secs();
+                            info!(
+                                "Progress: uptime={}s total={} parsed_ok={} unknown={} reconnects={}",
+                                uptime_secs,
+                                stats.total_messages,
+                                stats.parsed_ok,
+                                stats.unknown_type_count,
+                                reconnect_count
+                            );
+                            last_progress_log = Instant::now();
                         }
 
                         // Read with timeout for responsiveness
@@ -107,6 +139,16 @@ impl UserWsClient {
                                 let parsed = WsInboundMessage::parse(&text);
                                 stats.record(&parsed);
                                 total_collected += 1;
+
+                                // Periodic flush: every N messages or every T seconds
+                                let msgs_since_flush = total_collected - last_flush_count;
+                                if msgs_since_flush >= FLUSH_EVERY_MSGS
+                                    || last_flush.elapsed() >= Duration::from_secs(FLUSH_EVERY_SECS)
+                                {
+                                    file.flush().await?;
+                                    last_flush = Instant::now();
+                                    last_flush_count = total_collected;
+                                }
 
                                 if total_collected % 10 == 0 {
                                     debug!(
@@ -161,7 +203,8 @@ impl UserWsClient {
             }
 
             // Exponential backoff
-            warn!("Reconnecting in {} seconds...", backoff_secs);
+            reconnect_count += 1;
+            warn!("Reconnecting in {} seconds... (reconnect #{})", backoff_secs, reconnect_count);
             tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
             backoff_secs = (backoff_secs * 2).min(MAX_BACKOFF_SECS);
         }
@@ -169,9 +212,10 @@ impl UserWsClient {
         // Final flush
         file.flush().await?;
 
+        let uptime_secs = start_time.elapsed().as_secs();
         info!(
-            "User client stopped. Total: {}, Parsed: {}, Unknown: {}",
-            stats.total_messages, stats.parsed_ok, stats.unknown_type_count
+            "User client stopped. uptime={}s total={} parsed_ok={} unknown={} reconnects={}",
+            uptime_secs, stats.total_messages, stats.parsed_ok, stats.unknown_type_count, reconnect_count
         );
 
         Ok(stats)
