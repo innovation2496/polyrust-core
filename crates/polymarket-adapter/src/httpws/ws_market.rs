@@ -1,6 +1,6 @@
 //! WebSocket client for Polymarket market channel
 //!
-//! Endpoint: wss://ws-subscriptions-clob.polymarket.com/ws/
+//! Endpoint: wss://ws-subscriptions-clob.polymarket.com/ws/market
 //!
 //! # Features
 //! - Connect to market channel (no auth required)
@@ -8,6 +8,12 @@
 //! - Parse incoming messages with Unknown fallback
 //! - Write raw JSONL to file
 //! - Automatic reconnection with exponential backoff
+//! - Application-level PING/PONG (NOT WebSocket ping frames)
+//!
+//! # Important: Application-Level Keepalive
+//! Polymarket requires sending the literal string "PING" as a text message every 10 seconds.
+//! This is NOT the WebSocket protocol ping frame!
+//! See: https://docs.polymarket.com/developers/CLOB/websocket/wss-overview
 //!
 //! # Source
 //! - WSS Overview: https://docs.polymarket.com/developers/CLOB/websocket/wss-overview
@@ -42,6 +48,10 @@ const FLUSH_EVERY_SECS: u64 = 5;
 
 /// Log progress every N seconds
 const LOG_PROGRESS_EVERY_SECS: u64 = 60;
+
+/// Application-level PING interval (Polymarket requirement)
+/// Send literal "PING" text message every 10 seconds
+const APP_PING_INTERVAL_SECS: u64 = 10;
 
 /// Market channel WebSocket client
 pub struct MarketWsClient {
@@ -100,8 +110,18 @@ impl MarketWsClient {
                     info!("Connected and subscribed to market channel");
                     backoff_secs = INITIAL_BACKOFF_SECS; // Reset backoff on success
 
-                    // Read messages
-                    while !shutdown.load(Ordering::Relaxed) {
+                    // Application-level PING timer (Polymarket requirement)
+                    let mut ping_interval =
+                        tokio::time::interval(Duration::from_secs(APP_PING_INTERVAL_SECS));
+                    ping_interval.tick().await; // Skip first immediate tick
+
+                    // Read messages using select! to handle both reading and sending PINGs
+                    loop {
+                        // Check shutdown
+                        if shutdown.load(Ordering::Relaxed) {
+                            break;
+                        }
+
                         // Check limit
                         if limit > 0 && total_collected >= limit {
                             info!("Reached message limit: {}", limit);
@@ -124,64 +144,75 @@ impl MarketWsClient {
                             last_progress_log = Instant::now();
                         }
 
-                        // Read with timeout for responsiveness
-                        let msg = tokio::time::timeout(Duration::from_secs(30), read.next()).await;
-
-                        match msg {
-                            Ok(Some(Ok(Message::Text(text)))) => {
-                                // Write raw to file (JSONL format)
-                                file.write_all(text.as_bytes()).await?;
-                                file.write_all(b"\n").await?;
-
-                                // Parse and record stats
-                                let parsed = WsInboundMessage::parse(&text);
-                                stats.record(&parsed);
-                                total_collected += 1;
-
-                                // Periodic flush: every N messages or every T seconds
-                                let msgs_since_flush = total_collected - last_flush_count;
-                                if msgs_since_flush >= FLUSH_EVERY_MSGS
-                                    || last_flush.elapsed() >= Duration::from_secs(FLUSH_EVERY_SECS)
-                                {
-                                    file.flush().await?;
-                                    last_flush = Instant::now();
-                                    last_flush_count = total_collected;
-                                }
-
-                                if total_collected % 100 == 0 {
-                                    debug!(
-                                        "Collected {} messages, {} unknown",
-                                        total_collected, stats.unknown_type_count
-                                    );
-                                }
-                            }
-                            Ok(Some(Ok(Message::Ping(data)))) => {
-                                // Respond to ping
-                                if let Err(e) = write.send(Message::Pong(data)).await {
-                                    warn!("Failed to send pong: {}", e);
-                                }
-                            }
-                            Ok(Some(Ok(Message::Close(_)))) => {
-                                info!("Server closed connection");
-                                break;
-                            }
-                            Ok(Some(Ok(_))) => {
-                                // Binary or other message types - ignore
-                            }
-                            Ok(Some(Err(e))) => {
-                                warn!("WebSocket error: {}", e);
-                                break;
-                            }
-                            Ok(None) => {
-                                info!("WebSocket stream ended");
-                                break;
-                            }
-                            Err(_) => {
-                                // Timeout - send ping to keep alive
-                                debug!("Read timeout, sending ping");
-                                if let Err(e) = write.send(Message::Ping(vec![].into())).await {
-                                    warn!("Failed to send ping: {}", e);
+                        // Use select! to handle both message reading and PING sending
+                        tokio::select! {
+                            // Application-level PING (every 10 seconds)
+                            _ = ping_interval.tick() => {
+                                debug!("Sending application-level PING");
+                                if let Err(e) = write.send(Message::Text("PING".into())).await {
+                                    warn!("Failed to send PING: {}", e);
                                     break;
+                                }
+                            }
+
+                            // Read incoming messages
+                            msg = read.next() => {
+                                match msg {
+                                    Some(Ok(Message::Text(text))) => {
+                                        // Skip PONG responses (server echoes back)
+                                        let text_str: &str = text.as_ref();
+                                        if text_str == "PONG" {
+                                            debug!("Received PONG");
+                                            continue;
+                                        }
+
+                                        // Write raw to file (JSONL format)
+                                        file.write_all(text.as_bytes()).await?;
+                                        file.write_all(b"\n").await?;
+
+                                        // Parse and record stats
+                                        let parsed = WsInboundMessage::parse(&text);
+                                        stats.record(&parsed);
+                                        total_collected += 1;
+
+                                        // Periodic flush: every N messages or every T seconds
+                                        let msgs_since_flush = total_collected - last_flush_count;
+                                        if msgs_since_flush >= FLUSH_EVERY_MSGS
+                                            || last_flush.elapsed() >= Duration::from_secs(FLUSH_EVERY_SECS)
+                                        {
+                                            file.flush().await?;
+                                            last_flush = Instant::now();
+                                            last_flush_count = total_collected;
+                                        }
+
+                                        if total_collected % 100 == 0 {
+                                            debug!(
+                                                "Collected {} messages, {} unknown",
+                                                total_collected, stats.unknown_type_count
+                                            );
+                                        }
+                                    }
+                                    Some(Ok(Message::Ping(data))) => {
+                                        // Respond to WebSocket-level ping (if server sends it)
+                                        if let Err(e) = write.send(Message::Pong(data)).await {
+                                            warn!("Failed to send pong: {}", e);
+                                        }
+                                    }
+                                    Some(Ok(Message::Close(_))) => {
+                                        info!("Server closed connection");
+                                        break;
+                                    }
+                                    Some(Ok(_)) => {
+                                        // Binary or other message types - ignore
+                                    }
+                                    Some(Err(e)) => {
+                                        warn!("WebSocket error: {}", e);
+                                        break;
+                                    }
+                                    None => {
+                                        info!("WebSocket stream ended");
+                                        break;
+                                    }
                                 }
                             }
                         }
