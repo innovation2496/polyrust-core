@@ -493,8 +493,26 @@ impl WsInboundMessage {
 // Source: https://docs.polymarket.com/developers/gamma-markets-api/gamma-structure
 // ============================================================================
 
+/// Deserialize a stringified JSON array with default empty vec
+fn deserialize_stringified_array_or_default<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error;
+    let opt: Option<String> = serde::Deserialize::deserialize(deserializer)?;
+    match opt {
+        Some(s) if !s.is_empty() => {
+            serde_json::from_str(&s).map_err(|e| D::Error::custom(format!("Invalid JSON array: {}", e)))
+        }
+        _ => Ok(Vec::new()),
+    }
+}
+
 /// Gamma Market response from GET /markets or GET /markets/slug/{slug}
 /// Source: https://gamma-api.polymarket.com
+///
+/// Note: The Gamma API returns some fields as stringified JSON arrays (e.g., "[\"a\", \"b\"]")
+/// rather than actual JSON arrays. Custom deserializers handle this.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GammaMarket {
@@ -511,15 +529,18 @@ pub struct GammaMarket {
     pub condition_id: String,
 
     /// CLOB token IDs for each outcome (should be exactly 2 for binary markets)
-    #[serde(default)]
+    /// Note: API returns this as a stringified JSON array
+    #[serde(default, deserialize_with = "deserialize_stringified_array_or_default")]
     pub clob_token_ids: Vec<String>,
 
     /// Outcome labels (e.g., ["Up", "Down"] or ["Yes", "No"])
-    #[serde(default)]
+    /// Note: API returns this as a stringified JSON array
+    #[serde(default, deserialize_with = "deserialize_stringified_array_or_default")]
     pub outcomes: Vec<String>,
 
     /// Current outcome prices as decimal strings
-    #[serde(default)]
+    /// Note: API returns this as a stringified JSON array
+    #[serde(default, deserialize_with = "deserialize_stringified_array_or_default")]
     pub outcome_prices: Vec<String>,
 
     /// Market start time (ISO 8601)

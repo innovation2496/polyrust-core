@@ -41,7 +41,9 @@ impl GammaClient {
     }
 
     /// GET /markets/slug/{slug} - Get market by slug (most reliable)
-    /// Returns None if 404, errors on other failures
+    /// Returns None if 404 or empty array, errors on other failures
+    ///
+    /// Note: The Gamma API returns an array even for slug queries, so we take the first element.
     pub async fn get_market_by_slug(&self, slug: &str) -> Result<Option<GammaMarket>> {
         let url = format!("{}/markets/slug/{}", self.base_url, slug);
         debug!("GET {}", url);
@@ -61,8 +63,9 @@ impl GammaClient {
             anyhow::bail!("HTTP {} for {}: {}", status, url, body);
         }
 
-        let market: GammaMarket = response.json().await.context("Failed to parse GammaMarket")?;
-        Ok(Some(market))
+        // API returns an array, take first element
+        let markets: Vec<GammaMarket> = response.json().await.context("Failed to parse GammaMarket array")?;
+        Ok(markets.into_iter().next())
     }
 
     /// GET /markets?slug={slug} - Fallback query by slug
