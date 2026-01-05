@@ -34,9 +34,10 @@ pub const CLOB_REST_BASE: &str = "https://clob.polymarket.com";
 /// Source: https://docs.polymarket.com/quickstart/reference/endpoints
 pub const GAMMA_API_BASE: &str = "https://gamma-api.polymarket.com";
 
-/// Official CLOB WebSocket endpoint
-/// Source: https://docs.polymarket.com/quickstart/reference/endpoints
-pub const CLOB_WSS_ENDPOINT: &str = "wss://ws-subscriptions-clob.polymarket.com/ws/";
+/// Official CLOB WebSocket endpoint for Market Channel
+/// Source: https://docs.polymarket.com/developers/CLOB/websocket/market-channel
+/// Note: Use /ws/market for market channel, /ws/user for user channel
+pub const CLOB_WSS_ENDPOINT: &str = "wss://ws-subscriptions-clob.polymarket.com/ws/market";
 
 /// Official Real-Time Data Stream endpoint
 /// Source: https://docs.polymarket.com/quickstart/reference/endpoints
