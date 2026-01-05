@@ -237,8 +237,13 @@ impl MarketWsClient {
     )> {
         info!("Connecting to {}", self.endpoint);
 
-        let (ws_stream, response) =
-            connect_async(&self.endpoint).await.context("WebSocket connection failed")?;
+        let (ws_stream, response) = match connect_async(&self.endpoint).await {
+            Ok(r) => r,
+            Err(e) => {
+                error!("WebSocket connection error: {:?}", e);
+                return Err(anyhow::anyhow!("WebSocket connection failed: {}", e));
+            }
+        };
 
         debug!("WebSocket connected, status: {}", response.status());
 
