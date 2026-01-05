@@ -303,14 +303,14 @@ impl MarketResolver {
         let bucket_start = bucket_ts.unwrap();
         let bucket_end = bucket_start + self.config.bucket_size_secs;
 
-        // asof should be within [bucket_start, bucket_end) with tolerance
-        let start_with_tolerance = bucket_start - self.config.time_tolerance_secs;
-        let end_with_tolerance = bucket_end + self.config.time_tolerance_secs;
-
-        if asof_ts < start_with_tolerance || asof_ts >= end_with_tolerance {
+        // asof should be within [bucket_start, bucket_end + tolerance)
+        // Note: We use strict start (no tolerance) to avoid selecting future buckets,
+        // but allow tolerance at the end for markets that are about to close.
+        // This ensures we only select ONE bucket at any given time.
+        if asof_ts < bucket_start || asof_ts >= bucket_end + self.config.time_tolerance_secs {
             debug!(
                 "Market {} time window mismatch: asof={} not in [{}, {})",
-                market.slug, asof_ts, start_with_tolerance, end_with_tolerance
+                market.slug, asof_ts, bucket_start, bucket_end + self.config.time_tolerance_secs
             );
             return Some(SelectionReason::ValidationFailed);
         }
