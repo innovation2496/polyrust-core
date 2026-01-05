@@ -134,6 +134,9 @@ pub enum WsInboundMessage {
     Market(MarketMessage),
     /// Successfully parsed user channel message
     User(UserMessage),
+    /// Initial orderbook snapshot (top-level array on first subscribe)
+    /// This is a valid message type, not an error
+    SnapshotArray(Vec<Value>),
     /// Unknown or unparseable message - raw JSON preserved
     Unknown(UnknownMessage),
 }
@@ -441,6 +444,11 @@ impl WsInboundMessage {
             }
         };
 
+        // Check for top-level array (initial orderbook snapshot)
+        if let Some(arr) = raw.as_array() {
+            return WsInboundMessage::SnapshotArray(arr.clone());
+        }
+
         // Try to determine message type from event_type field
         if let Some(event_type) = raw.get("event_type").and_then(|v| v.as_str()) {
             // Try market channel messages
@@ -480,6 +488,7 @@ impl WsInboundMessage {
                 UserMessage::Trade(_) => "trade",
                 UserMessage::Order(_) => "order",
             }),
+            WsInboundMessage::SnapshotArray(_) => Some("snapshot_array"),
             WsInboundMessage::Unknown(u) => u.raw.get("event_type").and_then(|v| v.as_str()),
         }
     }
@@ -487,6 +496,11 @@ impl WsInboundMessage {
     /// Check if this is an unknown message type
     pub fn is_unknown(&self) -> bool {
         matches!(self, WsInboundMessage::Unknown(_))
+    }
+
+    /// Check if this is a snapshot array
+    pub fn is_snapshot_array(&self) -> bool {
+        matches!(self, WsInboundMessage::SnapshotArray(_))
     }
 }
 
@@ -727,6 +741,7 @@ pub struct MessageStats {
     pub total_messages: u64,
     pub parsed_ok: u64,
     pub unknown_type_count: u64,
+    pub snapshot_array_count: u64,
     pub parse_error_count: u64,
     pub type_counts: HashMap<String, u64>,
     pub last_message_type: Option<String>,
@@ -743,6 +758,10 @@ impl MessageStats {
         match msg {
             WsInboundMessage::Unknown(_) => {
                 self.unknown_type_count += 1;
+            }
+            WsInboundMessage::SnapshotArray(_) => {
+                self.snapshot_array_count += 1;
+                self.parsed_ok += 1; // Snapshot arrays are valid messages
             }
             _ => {
                 self.parsed_ok += 1;

@@ -181,6 +181,7 @@ async fn run_market_smoke(
     info!("Total messages: {}", stats.total_messages);
     info!("Parsed OK: {}", stats.parsed_ok);
     info!("Unknown type count: {}", stats.unknown_type_count);
+    info!("Snapshot arrays: {}", stats.snapshot_array_count);
     info!("Parse errors: {}", stats.parse_error_count);
     info!("Last message type: {:?}", stats.last_message_type);
     info!("");
@@ -245,6 +246,7 @@ async fn run_user_smoke(
     info!("Total messages: {}", stats.total_messages);
     info!("Parsed OK: {}", stats.parsed_ok);
     info!("Unknown type count: {}", stats.unknown_type_count);
+    info!("Snapshot arrays: {}", stats.snapshot_array_count);
     info!("Parse errors: {}", stats.parse_error_count);
     info!("Last message type: {:?}", stats.last_message_type);
     info!("");
