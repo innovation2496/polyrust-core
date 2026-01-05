@@ -5,21 +5,26 @@
 //! 2. Pre-resolve next market before boundary (lead_time)
 //! 3. Require N consecutive consistent resolutions (debounce)
 //! 4. Overlap old/new subscriptions during switch
+//! 5. Monotonicity: next.bucket_start must equal current.bucket_start + 900
+//! 6. Commit-time CLOB validation: re-validate tokens before switching
 //!
 //! # State Machine
 //! Stable -> Prepare (lead_time before boundary)
 //! Prepare -> Ready (N consecutive matches)
-//! Ready -> Committing (boundary reached)
+//! Ready -> Committing (boundary reached + CLOB check)
 //! Committing -> Stable (overlap complete)
 
 use std::time::Instant;
 
 use anyhow::Result;
 use chrono::{DateTime, TimeZone, Utc};
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use super::resolver::{MarketResolver, MarketSeries, ResolverConfig};
 use crate::types::{ResolveResult, ResolvedMarket, SwitchAction, SwitchConfig, SwitchPhase, SwitchStats};
+
+/// Bucket size in seconds (15 minutes)
+const BUCKET_SIZE_SECS: i64 = 900;
 
 /// Candidate for next market (during Prepare phase)
 #[derive(Clone, Debug)]
@@ -186,6 +191,24 @@ impl SwitchController {
             ResolveResult::Ok(market) => {
                 self.last_resolve_ok_at = Some(Instant::now());
 
+                // CRITICAL: Check monotonicity first
+                if !self.is_monotonic_advance(&market) {
+                    self.stats.freeze_count += 1;
+                    warn!(
+                        "Prepare: FREEZE_HARD - monotonicity violation for {}",
+                        market.slug
+                    );
+                    // Reset candidate and stay in Prepare
+                    self.next_candidate = None;
+                    return SwitchAction::Freeze {
+                        reason: "MonotonicityViolation".to_string(),
+                        message: format!(
+                            "next.bucket_start={} is not current+900",
+                            market.bucket_start_ts
+                        ),
+                    };
+                }
+
                 if self.is_consistent(&market) {
                     // Increment consecutive count
                     let candidate = self.next_candidate.as_mut().unwrap();
@@ -213,7 +236,7 @@ impl SwitchController {
                         }
                     }
                 } else {
-                    // New candidate or mismatch - reset
+                    // New candidate or mismatch - reset (but only if monotonic)
                     debug!("Prepare: new candidate or mismatch, resetting to: {}", market.slug);
                     self.next_candidate = Some(NextCandidate {
                         market,
@@ -234,15 +257,83 @@ impl SwitchController {
     }
 
     /// Poll in Ready phase - wait for boundary, then commit
+    /// Includes commit-time CLOB validation as final safety check
     async fn poll_ready(&mut self) -> SwitchAction {
         if !self.is_boundary_reached() {
             return SwitchAction::None;
         }
 
-        info!("Boundary reached, entering Committing phase");
+        info!("Boundary reached, performing commit-time CLOB validation...");
         self.boundary_reached_at = Some(Instant::now());
-        self.phase = SwitchPhase::Committing;
-        self.poll_committing().await
+
+        // Commit-time CLOB validation: re-check tokens before switching
+        if let Some(candidate) = &self.next_candidate {
+            let tokens = &candidate.market.clob_token_ids;
+            match self.validate_tokens_for_commit(tokens).await {
+                Ok(true) => {
+                    info!("Commit-time CLOB validation passed, entering Committing phase");
+                    self.phase = SwitchPhase::Committing;
+                    self.poll_committing().await
+                }
+                Ok(false) => {
+                    // Tokens exist but no valid price - FREEZE_SOFT, stay in Ready
+                    self.stats.freeze_count += 1;
+                    warn!("Commit-time CLOB validation failed: no price, staying in Ready");
+                    SwitchAction::Freeze {
+                        reason: "CommitClobNoPriceField".to_string(),
+                        message: "CLOB tokens have no price at commit time".to_string(),
+                    }
+                }
+                Err(e) => {
+                    // CLOB error - FREEZE_SOFT, stay in Ready and retry
+                    self.stats.freeze_count += 1;
+                    warn!("Commit-time CLOB validation error: {}, staying in Ready", e);
+                    SwitchAction::Freeze {
+                        reason: "CommitClobError".to_string(),
+                        message: format!("CLOB error at commit time: {}", e),
+                    }
+                }
+            }
+        } else {
+            warn!("Boundary reached but no next candidate, falling back to Stable");
+            self.phase = SwitchPhase::Stable;
+            SwitchAction::None
+        }
+    }
+
+    /// Validate tokens for commit-time check
+    /// Returns Ok(true) if tokens are tradeable, Ok(false) if no price, Err on API error
+    async fn validate_tokens_for_commit(&self, tokens: &[String; 2]) -> Result<bool> {
+        // Only check the first token (Up) - if one works, the pair is likely good
+        let token = &tokens[0];
+        debug!("Commit-time validation for token: {}", token);
+
+        // Use the resolver's internal CLOB client for price check
+        // Try both "BUY" and "buy" cases
+        for side in &["BUY", "buy"] {
+            match self.resolver.clob().get_price(token, side).await {
+                Ok(price_data) => {
+                    if price_data.get("price").is_some() {
+                        debug!("Commit-time CLOB check passed for {}", token);
+                        return Ok(true);
+                    } else {
+                        debug!("Commit-time CLOB check: no price field for {}", token);
+                        return Ok(false);
+                    }
+                }
+                Err(e) => {
+                    let error_str = e.to_string();
+                    // If 400 error, try next side variant
+                    if error_str.contains("400") || error_str.contains("Bad Request") {
+                        continue;
+                    }
+                    return Err(e);
+                }
+            }
+        }
+
+        // All side variants failed
+        anyhow::bail!("All CLOB side variants failed for commit-time check")
     }
 
     /// Poll in Committing phase - execute switch
@@ -332,6 +423,26 @@ impl SwitchController {
         }
     }
 
+    /// Check if next market is a valid monotonic advance from current
+    /// CRITICAL: Prevents "rollback" to older buckets
+    fn is_monotonic_advance(&self, next: &ResolvedMarket) -> bool {
+        match &self.current {
+            Some(current) => {
+                let expected_next = current.bucket_start_ts + BUCKET_SIZE_SECS;
+                if next.bucket_start_ts != expected_next {
+                    error!(
+                        "MONOTONICITY VIOLATION: current.bucket_start={}, next.bucket_start={}, expected={}",
+                        current.bucket_start_ts, next.bucket_start_ts, expected_next
+                    );
+                    return false;
+                }
+                true
+            }
+            // No current market - any bucket is acceptable for init
+            None => true,
+        }
+    }
+
     /// Check if current bucket boundary has been reached
     fn is_boundary_reached(&self) -> bool {
         let current = match &self.current {
@@ -375,7 +486,7 @@ mod tests {
     #[test]
     fn test_switch_config_default() {
         let config = SwitchConfig::default();
-        assert_eq!(config.lead_time_secs, 60);
+        assert_eq!(config.lead_time_secs, 90);  // 90s for more margin
         assert_eq!(config.min_consecutive, 3);
         assert_eq!(config.overlap_secs, 15);
         assert_eq!(config.poll_interval_ms, 2000);

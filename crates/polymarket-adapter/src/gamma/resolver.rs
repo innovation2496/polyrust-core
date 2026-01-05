@@ -120,6 +120,11 @@ impl MarketResolver {
         })
     }
 
+    /// Get reference to CLOB client (for commit-time validation)
+    pub fn clob(&self) -> &RestClient {
+        &self.clob
+    }
+
     /// Resolve the current market for a series
     ///
     /// # Arguments

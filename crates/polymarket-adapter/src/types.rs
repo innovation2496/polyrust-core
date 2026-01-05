@@ -812,7 +812,7 @@ pub struct SwitchConfig {
 impl Default for SwitchConfig {
     fn default() -> Self {
         Self {
-            lead_time_secs: 60,
+            lead_time_secs: 90,     // 90s gives Gamma/CLOB more time to publish
             min_consecutive: 3,
             overlap_secs: 15,
             poll_interval_ms: 2000,
