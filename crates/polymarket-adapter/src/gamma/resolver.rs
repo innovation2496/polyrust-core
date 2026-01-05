@@ -125,102 +125,85 @@ impl MarketResolver {
             series, asof, bucket_start
         );
 
-        // Generate candidate slugs
-        let mut candidate_slugs = Vec::new();
         let patterns = series.slug_patterns();
-
-        // Current bucket
-        for pattern in &patterns {
-            candidate_slugs.push(pattern.replace("{}", &bucket_start.to_string()));
-        }
-
-        // Adjacent buckets (optional)
-        if self.config.check_adjacent_buckets {
-            let prev_bucket = bucket_start - self.config.bucket_size_secs;
-            let next_bucket = bucket_start + self.config.bucket_size_secs;
-
-            for pattern in &patterns {
-                candidate_slugs.push(pattern.replace("{}", &prev_bucket.to_string()));
-                candidate_slugs.push(pattern.replace("{}", &next_bucket.to_string()));
-            }
-        }
-
-        debug!("Candidate slugs: {:?}", candidate_slugs);
-
-        // Query Gamma for each candidate
-        let mut valid_markets: Vec<GammaMarket> = Vec::new();
         let mut queried_slugs: Vec<String> = Vec::new();
 
-        for slug in &candidate_slugs {
+        // Strategy: Try current bucket FIRST (strict match, no tolerance)
+        // Only if not found, try with tolerance on previous bucket
+        // Never allow multiple candidates
+
+        // 1. Try current bucket (strict: asof in [bucket_start, bucket_end))
+        let current_bucket_slugs: Vec<String> = patterns
+            .iter()
+            .map(|p| p.replace("{}", &bucket_start.to_string()))
+            .collect();
+
+        for slug in &current_bucket_slugs {
+            debug!("Trying current bucket slug: {}", slug);
             match self.gamma.get_market_by_slug(slug).await {
                 Ok(Some(market)) => {
                     queried_slugs.push(slug.clone());
-
-                    // Validate market
-                    if let Some(reason) = self.validate_market(&market, asof_ts) {
-                        debug!("Market {} failed validation: {:?}", slug, reason);
-                        continue;
+                    // Strict validation: asof must be in [bucket_start, bucket_end)
+                    if market.is_valid_binary() && market.active && !market.closed {
+                        let bucket_end = bucket_start + self.config.bucket_size_secs;
+                        if asof_ts >= bucket_start && asof_ts < bucket_end {
+                            info!("Resolved to current bucket: {}", slug);
+                            return self.build_result(market, asof_ts);
+                        }
                     }
-
-                    info!("Valid candidate found: {}", slug);
-                    valid_markets.push(market);
+                    debug!("Current bucket {} found but validation failed", slug);
                 }
                 Ok(None) => {
-                    debug!("Slug not found: {}", slug);
+                    debug!("Current bucket slug not found: {}", slug);
                 }
                 Err(e) => {
                     warn!("Gamma API error for slug {}: {}", slug, e);
-                    // Continue trying other slugs
                 }
             }
         }
 
-        // Uniqueness check
-        if valid_markets.is_empty() {
-            return ResolveResult::Freeze {
-                reason: SelectionReason::NoCandidates,
-                message: "No valid market candidates found".to_string(),
-                candidates: queried_slugs,
-            };
-        }
+        // 2. If current bucket not found/valid, try previous bucket (with end tolerance)
+        // This handles the case where we're in the tolerance window after market closes
+        if self.config.check_adjacent_buckets {
+            let prev_bucket = bucket_start - self.config.bucket_size_secs;
+            let prev_bucket_slugs: Vec<String> = patterns
+                .iter()
+                .map(|p| p.replace("{}", &prev_bucket.to_string()))
+                .collect();
 
-        if valid_markets.len() > 1 {
-            return ResolveResult::Freeze {
-                reason: SelectionReason::AmbiguousCandidates,
-                message: format!("Found {} valid candidates, expected exactly 1", valid_markets.len()),
-                candidates: valid_markets.iter().map(|m| m.slug.clone()).collect(),
-            };
-        }
-
-        let market = valid_markets.remove(0);
-
-        // CLOB price validation
-        if self.config.clob_validation {
-            for token_id in &market.clob_token_ids {
-                match self.validate_clob_token(token_id).await {
-                    Ok(true) => {
-                        debug!("CLOB token {} validated OK", token_id);
+            for slug in &prev_bucket_slugs {
+                debug!("Trying previous bucket slug: {}", slug);
+                match self.gamma.get_market_by_slug(slug).await {
+                    Ok(Some(market)) => {
+                        queried_slugs.push(slug.clone());
+                        // With tolerance: asof can be up to tolerance seconds after bucket_end
+                        if let Some(_) = self.validate_market(&market, asof_ts) {
+                            debug!("Previous bucket {} found but validation failed", slug);
+                            continue;
+                        }
+                        info!("Resolved to previous bucket (with tolerance): {}", slug);
+                        return self.build_result(market, asof_ts);
                     }
-                    Ok(false) => {
-                        return ResolveResult::Freeze {
-                            reason: SelectionReason::ClobPriceCheckFailed,
-                            message: format!("CLOB price check failed for token {}", token_id),
-                            candidates: vec![market.slug.clone()],
-                        };
+                    Ok(None) => {
+                        debug!("Previous bucket slug not found: {}", slug);
                     }
                     Err(e) => {
-                        warn!("CLOB validation error for {}: {}", token_id, e);
-                        return ResolveResult::Freeze {
-                            reason: SelectionReason::ClobPriceCheckFailed,
-                            message: format!("CLOB API error: {}", e),
-                            candidates: vec![market.slug.clone()],
-                        };
+                        warn!("Gamma API error for slug {}: {}", slug, e);
                     }
                 }
             }
         }
 
-        // Build ResolvedMarket
+        // No valid market found
+        ResolveResult::Freeze {
+            reason: SelectionReason::NoCandidates,
+            message: "No valid market candidates found".to_string(),
+            candidates: queried_slugs,
+        }
+    }
+
+    /// Build successful result from a validated market
+    fn build_result(&self, market: GammaMarket, _asof_ts: i64) -> ResolveResult {
         let now_ms = Utc::now().timestamp_millis();
 
         // Convert clob_token_ids to fixed array
