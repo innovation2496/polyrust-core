@@ -291,33 +291,21 @@ impl MarketResolver {
             return Some(SelectionReason::ValidationFailed);
         }
 
-        // Check time window
-        let start_ts = market.start_timestamp();
-        let end_ts = market.end_timestamp();
-
-        if start_ts.is_none() || end_ts.is_none() {
-            debug!("Market {} missing start/end timestamps", market.slug);
+        // Extract trading window timestamp from slug
+        // Format: btc-updown-15m-{timestamp} or btc-up-or-down-15m-{timestamp}
+        // Note: API's startDate is market creation time, NOT the trading window!
+        let bucket_ts = self.extract_bucket_timestamp(&market.slug);
+        if bucket_ts.is_none() {
+            debug!("Market {} slug does not contain valid timestamp", market.slug);
             return Some(SelectionReason::ValidationFailed);
         }
 
-        let start_ts = start_ts.unwrap();
-        let end_ts = end_ts.unwrap();
+        let bucket_start = bucket_ts.unwrap();
+        let bucket_end = bucket_start + self.config.bucket_size_secs;
 
-        // Duration should be ~900s (15 minutes)
-        let duration = end_ts - start_ts;
-        let expected_duration = self.config.bucket_size_secs;
-        if (duration - expected_duration).abs() > self.config.time_tolerance_secs {
-            debug!(
-                "Market {} has unexpected duration: {}s (expected ~{}s)",
-                market.slug, duration, expected_duration
-            );
-            return Some(SelectionReason::ValidationFailed);
-        }
-
-        // asof should be within [start, end)
-        // With tolerance: start - tolerance <= asof < end + tolerance
-        let start_with_tolerance = start_ts - self.config.time_tolerance_secs;
-        let end_with_tolerance = end_ts + self.config.time_tolerance_secs;
+        // asof should be within [bucket_start, bucket_end) with tolerance
+        let start_with_tolerance = bucket_start - self.config.time_tolerance_secs;
+        let end_with_tolerance = bucket_end + self.config.time_tolerance_secs;
 
         if asof_ts < start_with_tolerance || asof_ts >= end_with_tolerance {
             debug!(
@@ -328,6 +316,13 @@ impl MarketResolver {
         }
 
         None // Valid
+    }
+
+    /// Extract bucket timestamp from slug
+    /// e.g., "btc-updown-15m-1767603600" -> Some(1767603600)
+    fn extract_bucket_timestamp(&self, slug: &str) -> Option<i64> {
+        // Find the last segment after "-" and try to parse as timestamp
+        slug.rsplit('-').next().and_then(|s| s.parse::<i64>().ok())
     }
 
     /// Validate a CLOB token by checking if we can get a price
