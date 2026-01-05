@@ -53,9 +53,9 @@ struct Cli {
 enum Commands {
     /// Subscribe to market channel and collect messages
     Market {
-        /// Asset ID (token_id) to subscribe to
-        #[arg(long)]
-        asset_id: String,
+        /// Asset ID(s) (token_id) to subscribe to. Can specify multiple times.
+        #[arg(long, required = true)]
+        asset_id: Vec<String>,
 
         /// Output file path for raw JSONL
         #[arg(long, default_value = "data/ws_market_raw.jsonl")]
@@ -133,8 +133,8 @@ async fn main() -> Result<()> {
     });
 
     match cli.command {
-        Commands::Market { asset_id, out, limit, enable_features } => {
-            run_market_smoke(asset_id, out, limit, enable_features, shutdown).await
+        Commands::Market { asset_id: asset_ids, out, limit, enable_features } => {
+            run_market_smoke(asset_ids, out, limit, enable_features, shutdown).await
         }
         Commands::User { market_id, out, limit } => {
             run_user_smoke(market_id, out, limit, shutdown).await
@@ -147,7 +147,7 @@ async fn main() -> Result<()> {
 }
 
 async fn run_market_smoke(
-    asset_id: String,
+    asset_ids: Vec<String>,
     out: PathBuf,
     limit: u64,
     enable_features: bool,
@@ -155,7 +155,10 @@ async fn run_market_smoke(
 ) -> Result<()> {
     info!("=== Market Channel Smoke Test ===");
     info!("Endpoint: {}", CLOB_WSS_ENDPOINT);
-    info!("Asset ID: {}", asset_id);
+    info!("Asset IDs: {} token(s)", asset_ids.len());
+    for (i, id) in asset_ids.iter().enumerate() {
+        info!("  [{}]: {}", i, id);
+    }
     info!("Output: {}", out.display());
     info!("Limit: {} (0 = unlimited)", limit);
     info!("Features enabled: {}", enable_features);
@@ -167,7 +170,7 @@ async fn run_market_smoke(
         tokio::fs::create_dir_all(parent).await?;
     }
 
-    let mut client = MarketWsClient::new(vec![asset_id]);
+    let mut client = MarketWsClient::new(asset_ids);
     client.set_enable_features(enable_features);
 
     let stats = client.run(&out, limit, shutdown).await?;
