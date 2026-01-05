@@ -21,8 +21,9 @@ use std::collections::HashMap;
 
 /// Channel type for WebSocket subscription
 /// Source: https://docs.polymarket.com/developers/CLOB/websocket/wss-overview
+/// Note: Polymarket uses lowercase "market" and "user" (not uppercase)
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "UPPERCASE")]
+#[serde(rename_all = "lowercase")]
 pub enum ChannelType {
     Market,
     User,
@@ -54,7 +55,8 @@ pub struct SubscribeRequest {
     pub markets: Option<Vec<String>>,
 
     /// Token IDs (for market channel)
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Note: Polymarket uses "assets_ids" (with extra 's') - not a typo!
+    #[serde(rename = "assets_ids", skip_serializing_if = "Option::is_none")]
     pub asset_ids: Option<Vec<String>>,
 
     /// Channel type: "MARKET" or "USER"
@@ -801,8 +803,9 @@ mod tests {
     fn test_subscribe_request_market() {
         let req = SubscribeRequest::market(vec!["asset1".to_string()], true);
         let json = serde_json::to_string(&req).unwrap();
-        assert!(json.contains("MARKET"));
-        assert!(json.contains("asset1"));
+        // Polymarket uses lowercase "market" and "assets_ids" (with extra 's')
+        assert!(json.contains("\"type\":\"market\""));
+        assert!(json.contains("\"assets_ids\":[\"asset1\"]"));
         assert!(json.contains("custom_feature_enabled"));
     }
 
@@ -815,7 +818,8 @@ mod tests {
         };
         let req = SubscribeRequest::user(auth, vec!["market1".to_string()]);
         let json = serde_json::to_string(&req).unwrap();
-        assert!(json.contains("USER"));
+        // Polymarket uses lowercase "user"
+        assert!(json.contains("\"type\":\"user\""));
         assert!(json.contains("apiKey"));
     }
 }
