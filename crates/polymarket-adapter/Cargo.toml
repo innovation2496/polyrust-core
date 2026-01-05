@@ -42,3 +42,7 @@ chrono.workspace = true
 # Official Polymarket client (optional, for rsclob backend)
 # Pin to 0.3.x as per official repo
 polymarket-client-sdk = { workspace = true, optional = true }
+
+[dev-dependencies]
+wiremock.workspace = true
+tokio-test = "0.4"

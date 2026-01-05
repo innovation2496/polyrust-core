@@ -605,6 +605,11 @@ pub struct GammaMarket {
     #[serde(default)]
     pub archived: bool,
 
+    /// Whether order book is enabled for this market
+    /// REQUIRED for trading - must be true
+    #[serde(default)]
+    pub enable_order_book: bool,
+
     /// Resolution source description
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resolution_source: Option<String>,
@@ -698,6 +703,20 @@ pub struct ResolvedMarket {
 
     /// Outcomes labels (typically ["Up", "Down"])
     pub outcomes: [String; 2],
+
+    // === Audit fields for observability ===
+
+    /// Reference time used for resolution (ISO 8601 UTC)
+    /// This is the "asof" input to the resolver
+    pub asof_utc: String,
+
+    /// Candidate slugs that were tried during resolution
+    /// Useful for debugging why a particular market was selected
+    pub candidate_slugs: Vec<String>,
+
+    /// Computed bucket start timestamp (Unix seconds)
+    /// The 15-minute window that was targeted
+    pub bucket_start_ts: i64,
 }
 
 /// Result of market resolution attempt

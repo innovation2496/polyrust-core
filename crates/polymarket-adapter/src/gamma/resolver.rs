@@ -107,6 +107,19 @@ impl MarketResolver {
         })
     }
 
+    /// Create with custom base URLs (for testing with wiremock)
+    pub fn with_base_urls(
+        gamma_base_url: &str,
+        clob_base_url: &str,
+        config: ResolverConfig,
+    ) -> Result<Self> {
+        Ok(Self {
+            gamma: GammaClient::with_base_url(gamma_base_url)?,
+            clob: RestClient::with_base_url(clob_base_url)?,
+            config,
+        })
+    }
+
     /// Resolve the current market for a series
     ///
     /// # Arguments
@@ -144,11 +157,24 @@ impl MarketResolver {
                 Ok(Some(market)) => {
                     queried_slugs.push(slug.clone());
                     // Strict validation: asof must be in [bucket_start, bucket_end)
-                    if market.is_valid_binary() && market.active && !market.closed {
+                    // Also check enableOrderBook
+                    if market.is_valid_binary()
+                        && market.active
+                        && !market.closed
+                        && market.enable_order_book
+                    {
                         let bucket_end = bucket_start + self.config.bucket_size_secs;
                         if asof_ts >= bucket_start && asof_ts < bucket_end {
                             info!("Resolved to current bucket: {}", slug);
-                            return self.build_result(market, asof_ts);
+                            // Perform CLOB validation if enabled
+                            if self.config.clob_validation {
+                                if let Some(freeze) =
+                                    self.validate_clob_tokens(&market, &queried_slugs).await
+                                {
+                                    return freeze;
+                                }
+                            }
+                            return self.build_result(market, asof, bucket_start, queried_slugs.clone());
                         }
                     }
                     debug!("Current bucket {} found but validation failed", slug);
@@ -182,7 +208,15 @@ impl MarketResolver {
                             continue;
                         }
                         info!("Resolved to previous bucket (with tolerance): {}", slug);
-                        return self.build_result(market, asof_ts);
+                        // Perform CLOB validation if enabled
+                        if self.config.clob_validation {
+                            if let Some(freeze) =
+                                self.validate_clob_tokens(&market, &queried_slugs).await
+                            {
+                                return freeze;
+                            }
+                        }
+                        return self.build_result(market, asof, bucket_start, queried_slugs.clone());
                     }
                     Ok(None) => {
                         debug!("Previous bucket slug not found: {}", slug);
@@ -203,7 +237,13 @@ impl MarketResolver {
     }
 
     /// Build successful result from a validated market
-    fn build_result(&self, market: GammaMarket, _asof_ts: i64) -> ResolveResult {
+    fn build_result(
+        &self,
+        market: GammaMarket,
+        asof: DateTime<Utc>,
+        bucket_start: i64,
+        candidate_slugs: Vec<String>,
+    ) -> ResolveResult {
         let now_ms = Utc::now().timestamp_millis();
 
         // Convert clob_token_ids to fixed array
@@ -242,11 +282,15 @@ impl MarketResolver {
             selected_at_ms: now_ms,
             selection_reason: SelectionReason::UniqueMatchInWindow,
             outcomes,
+            // Audit fields
+            asof_utc: asof.to_rfc3339(),
+            candidate_slugs,
+            bucket_start_ts: bucket_start,
         };
 
         info!(
-            "Successfully resolved market: {} (condition_id: {})",
-            resolved.slug, resolved.condition_id
+            "Successfully resolved market: {} (condition_id: {}, bucket_start: {})",
+            resolved.slug, resolved.condition_id, bucket_start
         );
 
         ResolveResult::Ok(resolved)
@@ -270,6 +314,15 @@ impl MarketResolver {
             debug!(
                 "Market {} is not active or is closed (active={}, closed={})",
                 market.slug, market.active, market.closed
+            );
+            return Some(SelectionReason::ValidationFailed);
+        }
+
+        // Check enableOrderBook (REQUIRED for trading)
+        if !market.enable_order_book {
+            debug!(
+                "Market {} has enableOrderBook=false, cannot trade",
+                market.slug
             );
             return Some(SelectionReason::ValidationFailed);
         }
@@ -309,23 +362,82 @@ impl MarketResolver {
     }
 
     /// Validate a CLOB token by checking if we can get a price
+    /// Implements side case fallback: try "BUY" first, then "buy" if 400 error
     async fn validate_clob_token(&self, token_id: &str) -> Result<bool> {
-        // Try to get price - if we get a response, token is valid
-        match self.clob.get_price(token_id, "buy").await {
-            Ok(price_data) => {
-                // Check if we got a valid price field
-                if price_data.get("price").is_some() {
-                    Ok(true)
-                } else {
-                    debug!("CLOB price response missing 'price' field for {}", token_id);
-                    Ok(false)
+        // Side variants to try (handles API documentation vs implementation differences)
+        const SIDE_VARIANTS: &[&str] = &["BUY", "buy"];
+
+        for (i, side) in SIDE_VARIANTS.iter().enumerate() {
+            debug!("Trying CLOB price check for {} with side={}", token_id, side);
+            match self.clob.get_price(token_id, side).await {
+                Ok(price_data) => {
+                    // Check if we got a valid price field
+                    if price_data.get("price").is_some() {
+                        return Ok(true);
+                    } else {
+                        debug!("CLOB price response missing 'price' field for {}", token_id);
+                        return Ok(false);
+                    }
+                }
+                Err(e) => {
+                    let error_str = e.to_string();
+                    // If it looks like a 400 error and we have more variants to try, continue
+                    let is_likely_400 = error_str.contains("400")
+                        || error_str.contains("Bad Request")
+                        || error_str.contains("invalid");
+
+                    if is_likely_400 && i + 1 < SIDE_VARIANTS.len() {
+                        debug!(
+                            "CLOB side={} failed ({}), trying next variant",
+                            side, error_str
+                        );
+                        continue;
+                    }
+                    // Last variant or non-retryable error
+                    return Err(e);
                 }
             }
-            Err(e) => {
-                // CLOB API error
-                Err(e)
+        }
+
+        // Should not reach here, but just in case
+        anyhow::bail!("All CLOB side variants exhausted for token {}", token_id);
+    }
+
+    /// Validate both CLOB tokens for a market
+    /// Returns Some(FREEZE) if validation fails, None if successful
+    async fn validate_clob_tokens(
+        &self,
+        market: &GammaMarket,
+        queried_slugs: &[String],
+    ) -> Option<ResolveResult> {
+        for (i, token_id) in market.clob_token_ids.iter().enumerate() {
+            debug!("Validating CLOB token {}: {}", i, token_id);
+            match self.validate_clob_token(token_id).await {
+                Ok(true) => {
+                    debug!("CLOB token {} validated OK", token_id);
+                }
+                Ok(false) => {
+                    warn!("CLOB token {} validation failed: no price returned", token_id);
+                    return Some(ResolveResult::Freeze {
+                        reason: SelectionReason::ClobPriceCheckFailed,
+                        message: format!(
+                            "CLOB price check failed for token {} (no price field)",
+                            token_id
+                        ),
+                        candidates: queried_slugs.to_vec(),
+                    });
+                }
+                Err(e) => {
+                    warn!("CLOB API error for token {}: {}", token_id, e);
+                    return Some(ResolveResult::Freeze {
+                        reason: SelectionReason::ClobPriceCheckFailed,
+                        message: format!("CLOB API error for token {}: {}", token_id, e),
+                        candidates: queried_slugs.to_vec(),
+                    });
+                }
             }
         }
+        None // All tokens validated OK
     }
 }
 
@@ -362,5 +474,486 @@ mod tests {
 
         assert!(slugs.contains(&"btc-updown-15m-1767301200".to_string()));
         assert!(slugs.contains(&"btc-up-or-down-15m-1767301200".to_string()));
+    }
+}
+
+/// Wiremock integration tests for MarketResolver
+/// Tests cover: unique candidate success, zero candidates, CLOB validation failure, time window mismatch
+#[cfg(test)]
+mod wiremock_tests {
+    use super::*;
+    use chrono::TimeZone;
+    use wiremock::matchers::{method, path, path_regex, query_param};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    /// Helper: Create a valid GammaMarket JSON response
+    fn make_gamma_market_json(slug: &str, token_ids: &[&str]) -> serde_json::Value {
+        serde_json::json!({
+            "id": "market-id-123",
+            "slug": slug,
+            "question": "Will BTC be up or down?",
+            "conditionId": "condition-id-456",
+            "clobTokenIds": serde_json::to_string(&token_ids).unwrap(),
+            "outcomes": "[\"Up\",\"Down\"]",
+            "outcomePrices": "[\"0.50\",\"0.50\"]",
+            "startDate": "2026-01-05T11:00:00Z",
+            "endDate": "2026-01-05T11:15:00Z",
+            "active": true,
+            "closed": false,
+            "archived": false,
+            "enableOrderBook": true
+        })
+    }
+
+    /// Helper: Create a valid CLOB price response
+    fn make_clob_price_json(price: &str) -> serde_json::Value {
+        serde_json::json!({
+            "price": price
+        })
+    }
+
+    /// Test: Unique candidate success
+    /// Gamma returns exactly one valid market, CLOB returns valid prices
+    #[tokio::test]
+    async fn test_unique_candidate_success() {
+        // Start mock servers
+        let gamma_server = MockServer::start().await;
+        let clob_server = MockServer::start().await;
+
+        // Use a 15-minute aligned timestamp: 1736073000 is divisible by 900
+        // 1736073000 / 900 = 1928970 (exact)
+        let bucket_start = 1736073000i64;
+        let asof_ts = bucket_start + 300; // 5 minutes into the bucket
+        let slug = format!("btc-updown-15m-{}", bucket_start);
+
+        // Mock Gamma: GET /markets/slug/{slug} returns valid market
+        Mock::given(method("GET"))
+            .and(path(format!("/markets/slug/{}", slug)))
+            .respond_with(ResponseTemplate::new(200).set_body_json(make_gamma_market_json(
+                &slug,
+                &["token-up-111", "token-down-222"],
+            )))
+            .mount(&gamma_server)
+            .await;
+
+        // Mock Gamma: Old format slug returns 404
+        let old_slug = format!("btc-up-or-down-15m-{}", bucket_start);
+        Mock::given(method("GET"))
+            .and(path(format!("/markets/slug/{}", old_slug)))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&gamma_server)
+            .await;
+
+        // Mock CLOB: GET /price returns valid prices for both tokens
+        Mock::given(method("GET"))
+            .and(path("/price"))
+            .and(query_param("token_id", "token-up-111"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(make_clob_price_json("0.55")))
+            .mount(&clob_server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/price"))
+            .and(query_param("token_id", "token-down-222"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(make_clob_price_json("0.45")))
+            .mount(&clob_server)
+            .await;
+
+        // Create resolver with mock URLs
+        let config = ResolverConfig::default();
+        let resolver =
+            MarketResolver::with_base_urls(&gamma_server.uri(), &clob_server.uri(), config)
+                .expect("Failed to create resolver");
+
+        // Resolve
+        let asof = Utc.timestamp_opt(asof_ts, 0).unwrap();
+        let result = resolver.resolve(&MarketSeries::Btc15m, asof).await;
+
+        // Assert success
+        assert!(result.is_ok(), "Expected Ok, got {:?}", result);
+        let market = result.market().unwrap();
+        assert_eq!(market.slug, slug);
+        assert_eq!(market.clob_token_ids[0], "token-up-111");
+        assert_eq!(market.clob_token_ids[1], "token-down-222");
+        assert_eq!(market.selection_reason, SelectionReason::UniqueMatchInWindow);
+    }
+
+    /// Test: Zero candidates (FREEZE)
+    /// Gamma returns 404 for all slug patterns
+    #[tokio::test]
+    async fn test_zero_candidates_freeze() {
+        let gamma_server = MockServer::start().await;
+        let clob_server = MockServer::start().await;
+
+        // Mock Gamma: All slug patterns return 404
+        Mock::given(method("GET"))
+            .and(path_regex(r"/markets/slug/.*"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&gamma_server)
+            .await;
+
+        let config = ResolverConfig::default();
+        let resolver =
+            MarketResolver::with_base_urls(&gamma_server.uri(), &clob_server.uri(), config)
+                .expect("Failed to create resolver");
+
+        let asof = Utc::now();
+        let result = resolver.resolve(&MarketSeries::Btc15m, asof).await;
+
+        // Assert FREEZE with NoCandidates
+        assert!(!result.is_ok(), "Expected Freeze, got Ok");
+        match result {
+            ResolveResult::Freeze { reason, message, .. } => {
+                assert_eq!(reason, SelectionReason::NoCandidates);
+                assert!(message.contains("No valid market candidates"));
+            }
+            _ => panic!("Expected Freeze"),
+        }
+    }
+
+    /// Test: CLOB validation failure (FREEZE)
+    /// Gamma returns valid market, but CLOB returns error
+    #[tokio::test]
+    async fn test_clob_validation_failure_freeze() {
+        let gamma_server = MockServer::start().await;
+        let clob_server = MockServer::start().await;
+
+        // Use 15-minute aligned timestamp
+        let bucket_start = 1736073000i64;
+        let asof_ts = bucket_start + 300;
+        let slug = format!("btc-updown-15m-{}", bucket_start);
+
+        // Mock Gamma: Returns valid market
+        Mock::given(method("GET"))
+            .and(path(format!("/markets/slug/{}", slug)))
+            .respond_with(ResponseTemplate::new(200).set_body_json(make_gamma_market_json(
+                &slug,
+                &["token-up-111", "token-down-222"],
+            )))
+            .mount(&gamma_server)
+            .await;
+
+        // Mock old format 404
+        let old_slug = format!("btc-up-or-down-15m-{}", bucket_start);
+        Mock::given(method("GET"))
+            .and(path(format!("/markets/slug/{}", old_slug)))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&gamma_server)
+            .await;
+
+        // Mock CLOB: Returns 500 error for first token
+        Mock::given(method("GET"))
+            .and(path("/price"))
+            .and(query_param("token_id", "token-up-111"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("Internal Server Error"))
+            .mount(&clob_server)
+            .await;
+
+        let config = ResolverConfig::default();
+        let resolver =
+            MarketResolver::with_base_urls(&gamma_server.uri(), &clob_server.uri(), config)
+                .expect("Failed to create resolver");
+
+        let asof = Utc.timestamp_opt(asof_ts, 0).unwrap();
+        let result = resolver.resolve(&MarketSeries::Btc15m, asof).await;
+
+        // Assert FREEZE with ClobPriceCheckFailed
+        assert!(!result.is_ok(), "Expected Freeze, got Ok");
+        match result {
+            ResolveResult::Freeze { reason, message, .. } => {
+                assert_eq!(reason, SelectionReason::ClobPriceCheckFailed);
+                assert!(message.contains("CLOB") || message.contains("token"));
+            }
+            _ => panic!("Expected Freeze"),
+        }
+    }
+
+    /// Test: CLOB returns empty price field (FREEZE)
+    #[tokio::test]
+    async fn test_clob_no_price_field_freeze() {
+        let gamma_server = MockServer::start().await;
+        let clob_server = MockServer::start().await;
+
+        // Use 15-minute aligned timestamp
+        let bucket_start = 1736073000i64;
+        let asof_ts = bucket_start + 300;
+        let slug = format!("btc-updown-15m-{}", bucket_start);
+
+        // Mock Gamma: Returns valid market
+        Mock::given(method("GET"))
+            .and(path(format!("/markets/slug/{}", slug)))
+            .respond_with(ResponseTemplate::new(200).set_body_json(make_gamma_market_json(
+                &slug,
+                &["token-up-111", "token-down-222"],
+            )))
+            .mount(&gamma_server)
+            .await;
+
+        let old_slug = format!("btc-up-or-down-15m-{}", bucket_start);
+        Mock::given(method("GET"))
+            .and(path(format!("/markets/slug/{}", old_slug)))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&gamma_server)
+            .await;
+
+        // Mock CLOB: Returns response WITHOUT price field
+        Mock::given(method("GET"))
+            .and(path("/price"))
+            .and(query_param("token_id", "token-up-111"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"status": "ok"})),
+            )
+            .mount(&clob_server)
+            .await;
+
+        let config = ResolverConfig::default();
+        let resolver =
+            MarketResolver::with_base_urls(&gamma_server.uri(), &clob_server.uri(), config)
+                .expect("Failed to create resolver");
+
+        let asof = Utc.timestamp_opt(asof_ts, 0).unwrap();
+        let result = resolver.resolve(&MarketSeries::Btc15m, asof).await;
+
+        // Assert FREEZE
+        assert!(!result.is_ok(), "Expected Freeze due to missing price field");
+        match result {
+            ResolveResult::Freeze { reason, message, .. } => {
+                assert_eq!(reason, SelectionReason::ClobPriceCheckFailed);
+                assert!(message.contains("no price field"));
+            }
+            _ => panic!("Expected Freeze"),
+        }
+    }
+
+    /// Test: Time window mismatch (FREEZE)
+    /// asof is outside the bucket window - no markets found
+    #[tokio::test]
+    async fn test_time_window_mismatch_freeze() {
+        let gamma_server = MockServer::start().await;
+        let clob_server = MockServer::start().await;
+
+        // asof is arbitrary, resolver will calculate expected bucket
+        let asof_ts = 1736080800i64; // Some timestamp
+        let _expected_bucket = (asof_ts / 900) * 900;
+
+        // Mock: All slug lookups return 404 (no market exists)
+        Mock::given(method("GET"))
+            .and(path_regex(r"/markets/slug/.*"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&gamma_server)
+            .await;
+
+        let config = ResolverConfig::default();
+        let resolver =
+            MarketResolver::with_base_urls(&gamma_server.uri(), &clob_server.uri(), config)
+                .expect("Failed to create resolver");
+
+        let asof = Utc.timestamp_opt(asof_ts, 0).unwrap();
+        let result = resolver.resolve(&MarketSeries::Btc15m, asof).await;
+
+        // Should FREEZE due to no candidates
+        assert!(!result.is_ok(), "Expected Freeze");
+        match result {
+            ResolveResult::Freeze { reason, .. } => {
+                assert_eq!(reason, SelectionReason::NoCandidates);
+            }
+            _ => panic!("Expected Freeze"),
+        }
+    }
+
+    /// Test: enableOrderBook = false causes FREEZE
+    #[tokio::test]
+    async fn test_enable_order_book_false_freeze() {
+        let gamma_server = MockServer::start().await;
+        let clob_server = MockServer::start().await;
+
+        // Use 15-minute aligned timestamp
+        let bucket_start = 1736073000i64;
+        let asof_ts = bucket_start + 300;
+        let slug = format!("btc-updown-15m-{}", bucket_start);
+
+        // Mock Gamma: Returns market with enableOrderBook = false
+        let market_json = serde_json::json!({
+            "id": "market-id-123",
+            "slug": slug,
+            "question": "Will BTC be up or down?",
+            "conditionId": "condition-id-456",
+            "clobTokenIds": "[\"token-up-111\",\"token-down-222\"]",
+            "outcomes": "[\"Up\",\"Down\"]",
+            "outcomePrices": "[\"0.50\",\"0.50\"]",
+            "active": true,
+            "closed": false,
+            "enableOrderBook": false  // KEY: disabled!
+        });
+
+        Mock::given(method("GET"))
+            .and(path(format!("/markets/slug/{}", slug)))
+            .respond_with(ResponseTemplate::new(200).set_body_json(market_json))
+            .mount(&gamma_server)
+            .await;
+
+        let old_slug = format!("btc-up-or-down-15m-{}", bucket_start);
+        Mock::given(method("GET"))
+            .and(path(format!("/markets/slug/{}", old_slug)))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&gamma_server)
+            .await;
+
+        // Also mock previous bucket as 404
+        let prev_bucket = bucket_start - 900;
+        Mock::given(method("GET"))
+            .and(path(format!("/markets/slug/btc-updown-15m-{}", prev_bucket)))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&gamma_server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/markets/slug/btc-up-or-down-15m-{}", prev_bucket)))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&gamma_server)
+            .await;
+
+        let config = ResolverConfig::default();
+        let resolver =
+            MarketResolver::with_base_urls(&gamma_server.uri(), &clob_server.uri(), config)
+                .expect("Failed to create resolver");
+
+        let asof = Utc.timestamp_opt(asof_ts, 0).unwrap();
+        let result = resolver.resolve(&MarketSeries::Btc15m, asof).await;
+
+        // Should FREEZE because enableOrderBook = false makes validation fail
+        assert!(!result.is_ok(), "Expected Freeze due to enableOrderBook=false");
+    }
+
+    /// Test: CLOB validation disabled via config
+    #[tokio::test]
+    async fn test_clob_validation_disabled_success() {
+        let gamma_server = MockServer::start().await;
+        let clob_server = MockServer::start().await;
+
+        // Use 15-minute aligned timestamp
+        let bucket_start = 1736073000i64;
+        let asof_ts = bucket_start + 300;
+        let slug = format!("btc-updown-15m-{}", bucket_start);
+
+        Mock::given(method("GET"))
+            .and(path(format!("/markets/slug/{}", slug)))
+            .respond_with(ResponseTemplate::new(200).set_body_json(make_gamma_market_json(
+                &slug,
+                &["token-up-111", "token-down-222"],
+            )))
+            .mount(&gamma_server)
+            .await;
+
+        let old_slug = format!("btc-up-or-down-15m-{}", bucket_start);
+        Mock::given(method("GET"))
+            .and(path(format!("/markets/slug/{}", old_slug)))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&gamma_server)
+            .await;
+
+        // Note: NO CLOB mocks - if CLOB validation is called, test will fail
+
+        // Disable CLOB validation
+        let mut config = ResolverConfig::default();
+        config.clob_validation = false;
+
+        let resolver =
+            MarketResolver::with_base_urls(&gamma_server.uri(), &clob_server.uri(), config)
+                .expect("Failed to create resolver");
+
+        let asof = Utc.timestamp_opt(asof_ts, 0).unwrap();
+        let result = resolver.resolve(&MarketSeries::Btc15m, asof).await;
+
+        // Should succeed even without CLOB validation
+        assert!(result.is_ok(), "Expected Ok when CLOB validation is disabled");
+    }
+
+    /// Test: CLOB side case fallback (BUY -> buy)
+    /// First request with side=BUY returns 400, second with side=buy succeeds
+    #[tokio::test]
+    async fn test_clob_side_case_fallback_success() {
+        let gamma_server = MockServer::start().await;
+        let clob_server = MockServer::start().await;
+
+        let bucket_start = 1736073000i64;
+        let asof_ts = bucket_start + 300;
+        let slug = format!("btc-updown-15m-{}", bucket_start);
+
+        // Mock Gamma: Returns valid market
+        Mock::given(method("GET"))
+            .and(path(format!("/markets/slug/{}", slug)))
+            .respond_with(ResponseTemplate::new(200).set_body_json(make_gamma_market_json(
+                &slug,
+                &["token-up-111", "token-down-222"],
+            )))
+            .mount(&gamma_server)
+            .await;
+
+        let old_slug = format!("btc-up-or-down-15m-{}", bucket_start);
+        Mock::given(method("GET"))
+            .and(path(format!("/markets/slug/{}", old_slug)))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&gamma_server)
+            .await;
+
+        // Mock CLOB: side=BUY returns 400 Bad Request
+        Mock::given(method("GET"))
+            .and(path("/price"))
+            .and(query_param("token_id", "token-up-111"))
+            .and(query_param("side", "BUY"))
+            .respond_with(
+                ResponseTemplate::new(400).set_body_string("Bad Request: invalid side parameter"),
+            )
+            .mount(&clob_server)
+            .await;
+
+        // Mock CLOB: side=buy returns valid price
+        Mock::given(method("GET"))
+            .and(path("/price"))
+            .and(query_param("token_id", "token-up-111"))
+            .and(query_param("side", "buy"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(make_clob_price_json("0.55")))
+            .mount(&clob_server)
+            .await;
+
+        // Mock second token - also with fallback
+        Mock::given(method("GET"))
+            .and(path("/price"))
+            .and(query_param("token_id", "token-down-222"))
+            .and(query_param("side", "BUY"))
+            .respond_with(
+                ResponseTemplate::new(400).set_body_string("Bad Request: invalid side parameter"),
+            )
+            .mount(&clob_server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/price"))
+            .and(query_param("token_id", "token-down-222"))
+            .and(query_param("side", "buy"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(make_clob_price_json("0.45")))
+            .mount(&clob_server)
+            .await;
+
+        let config = ResolverConfig::default();
+        let resolver =
+            MarketResolver::with_base_urls(&gamma_server.uri(), &clob_server.uri(), config)
+                .expect("Failed to create resolver");
+
+        let asof = Utc.timestamp_opt(asof_ts, 0).unwrap();
+        let result = resolver.resolve(&MarketSeries::Btc15m, asof).await;
+
+        // Should succeed after falling back to lowercase "buy"
+        assert!(
+            result.is_ok(),
+            "Expected Ok after side case fallback, got {:?}",
+            result
+        );
+
+        // Verify audit fields are present
+        let market = result.market().unwrap();
+        assert!(!market.asof_utc.is_empty());
+        assert!(!market.candidate_slugs.is_empty());
+        assert_eq!(market.bucket_start_ts, bucket_start);
     }
 }

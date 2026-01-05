@@ -45,3 +45,6 @@ chrono = { version = "0.4", features = ["serde"] }
 
 # Official Polymarket client (pinned version)
 polymarket-client-sdk = "0.3"
+
+# Testing
+wiremock = "0.6"
