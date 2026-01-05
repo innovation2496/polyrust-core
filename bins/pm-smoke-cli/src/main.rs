@@ -31,9 +31,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tracing::{error, info, warn};
 
-use polymarket_adapter::gamma::{MarketResolver, MarketSeries};
+use polymarket_adapter::gamma::{MarketResolver, MarketSeries, SwitchController};
 use polymarket_adapter::httpws::{ApiCredentials, MarketWsClient, RestClient, UserWsClient};
-use polymarket_adapter::types::ResolveResult;
+use polymarket_adapter::types::{ResolveResult, SwitchAction, SwitchConfig};
 use polymarket_adapter::{CLOB_REST_BASE, CLOB_WSS_ENDPOINT, GAMMA_API_BASE};
 
 #[derive(Parser)]
@@ -110,6 +110,29 @@ enum Commands {
         #[arg(long, default_value = "false")]
         skip_clob_check: bool,
     },
+
+    /// Watch market switches with two-phase safety rails
+    SwitchWatch {
+        /// Market series to watch (btc15m, eth15m)
+        #[arg(long)]
+        series: String,
+
+        /// Seconds before boundary to start preparing next (default: 60)
+        #[arg(long, default_value = "60")]
+        lead_time: i64,
+
+        /// Minimum consecutive consistent resolutions (default: 3)
+        #[arg(long, default_value = "3")]
+        min_consecutive: u32,
+
+        /// Polling interval in milliseconds (default: 2000)
+        #[arg(long, default_value = "2000")]
+        poll_interval: u64,
+
+        /// Duration to run in seconds (0 = run until Ctrl+C)
+        #[arg(long, default_value = "0")]
+        duration: u64,
+    },
 }
 
 #[tokio::main]
@@ -142,6 +165,10 @@ async fn main() -> Result<()> {
         Commands::Rest { asset_id } => run_rest_smoke(asset_id).await,
         Commands::Resolve { series, asof, out, skip_clob_check } => {
             run_resolve(series, asof, out, skip_clob_check).await
+        }
+        Commands::SwitchWatch { series, lead_time, min_consecutive, poll_interval, duration } => {
+            run_switch_watch(series, lead_time, min_consecutive, poll_interval, duration, shutdown)
+                .await
         }
     }
 }
@@ -432,6 +459,141 @@ async fn run_resolve(
     if !result.is_ok() {
         anyhow::bail!("Market resolution failed - FREEZE");
     }
+
+    Ok(())
+}
+
+async fn run_switch_watch(
+    series: String,
+    lead_time: i64,
+    min_consecutive: u32,
+    poll_interval: u64,
+    duration: u64,
+    shutdown: Arc<AtomicBool>,
+) -> Result<()> {
+    info!("=== Switch Watch (Two-Phase Safety Rails) ===");
+    info!("Gamma API: {}", GAMMA_API_BASE);
+    info!("CLOB API: {}", CLOB_REST_BASE);
+    info!("Series: {}", series);
+    info!("");
+
+    // Parse series
+    let market_series = match MarketSeries::from_str(&series) {
+        Some(s) => s,
+        None => {
+            error!("Unknown series: {}. Supported: btc15m, eth15m", series);
+            anyhow::bail!("Unknown series: {}", series);
+        }
+    };
+
+    // Create config
+    let config = SwitchConfig {
+        lead_time_secs: lead_time,
+        min_consecutive,
+        overlap_secs: 15,
+        poll_interval_ms: poll_interval,
+    };
+
+    info!("Configuration:");
+    info!("  lead_time_secs: {}", config.lead_time_secs);
+    info!("  min_consecutive: {}", config.min_consecutive);
+    info!("  overlap_secs: {}", config.overlap_secs);
+    info!("  poll_interval_ms: {}", config.poll_interval_ms);
+    if duration > 0 {
+        info!("  duration: {}s", duration);
+    } else {
+        info!("  duration: unlimited (Ctrl+C to stop)");
+    }
+    info!("");
+
+    // Create controller
+    let mut controller = SwitchController::new(market_series, config)?;
+
+    // Initialize
+    info!("Initializing...");
+    let init_action = controller.init().await?;
+    match &init_action {
+        SwitchAction::SubscribeNew { tokens, slug } => {
+            info!("Initial market: {}", slug);
+            info!("  Token[0]: {}", tokens[0]);
+            info!("  Token[1]: {}", tokens[1]);
+        }
+        SwitchAction::Freeze { reason, message } => {
+            error!("Init FREEZE: {} - {}", reason, message);
+            anyhow::bail!("Failed to initialize: {}", message);
+        }
+        _ => {}
+    }
+    info!("");
+    info!("Watching for switches...");
+    info!("Press Ctrl+C to stop");
+    info!("");
+
+    let start = std::time::Instant::now();
+    let mut last_status_print = std::time::Instant::now();
+    let status_interval = std::time::Duration::from_secs(10);
+
+    loop {
+        // Check shutdown
+        if shutdown.load(Ordering::Relaxed) {
+            info!("Shutdown requested");
+            break;
+        }
+
+        // Check duration
+        if duration > 0 && start.elapsed().as_secs() >= duration {
+            info!("Duration {} seconds reached", duration);
+            break;
+        }
+
+        // Poll controller
+        let action = controller.poll().await;
+
+        // Handle action
+        match &action {
+            SwitchAction::None => {}
+            SwitchAction::SubscribeNew { tokens, slug } => {
+                info!(">>> SWITCH: Subscribe new market: {}", slug);
+                info!("    Token[0]: {}", tokens[0]);
+                info!("    Token[1]: {}", tokens[1]);
+            }
+            SwitchAction::UnsubscribeOld { tokens, slug } => {
+                info!("<<< OVERLAP COMPLETE: Unsubscribe old: {}", slug);
+                info!("    Token[0]: {}", tokens[0]);
+                info!("    Token[1]: {}", tokens[1]);
+            }
+            SwitchAction::SwitchComplete { from_slug, to_slug } => {
+                info!("=== SWITCH COMPLETE: {} -> {}", from_slug, to_slug);
+            }
+            SwitchAction::Freeze { reason, message } => {
+                warn!("!!! FREEZE: {} - {}", reason, message);
+            }
+        }
+
+        // Print status every 10 seconds
+        if last_status_print.elapsed() >= status_interval {
+            info!("{}", controller.status_line());
+            last_status_print = std::time::Instant::now();
+        }
+
+        // Wait for next poll
+        tokio::time::sleep(std::time::Duration::from_millis(poll_interval)).await;
+    }
+
+    // Print final stats
+    let stats = controller.stats();
+    info!("");
+    info!("=== Final Statistics ===");
+    info!("Total switches: {}", stats.switch_count);
+    info!("Total freezes: {}", stats.freeze_count);
+    if let Some(lead) = stats.last_ready_lead_secs {
+        info!("Last ready lead time: {}s before boundary", lead);
+    }
+    if let Some(latency) = stats.last_switch_latency_ms {
+        info!("Last switch latency: {}ms", latency);
+    }
+    info!("");
+    info!("Final state: {}", controller.status_line());
 
     Ok(())
 }

@@ -751,6 +751,89 @@ impl ResolveResult {
 }
 
 // ============================================================================
+// Switch Controller Types (Two-Phase Switch Safety Rails)
+// ============================================================================
+
+/// Switch state machine phase
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SwitchPhase {
+    /// Stable operation, using current market
+    Stable,
+    /// Preparing next market (within lead_time of boundary)
+    Prepare,
+    /// Next market ready (passed consistency check)
+    Ready,
+    /// Committing switch (subscribe new, then unsubscribe old)
+    Committing,
+}
+
+/// Action returned by SwitchController::poll()
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case")]
+pub enum SwitchAction {
+    /// No action needed
+    None,
+    /// Subscribe to new tokens (but don't unsubscribe old yet)
+    SubscribeNew {
+        tokens: [String; 2],
+        slug: String,
+    },
+    /// Unsubscribe old tokens (after overlap period)
+    UnsubscribeOld {
+        tokens: [String; 2],
+        slug: String,
+    },
+    /// Switch completed successfully
+    SwitchComplete {
+        from_slug: String,
+        to_slug: String,
+    },
+    /// Freeze - do not switch
+    Freeze {
+        reason: String,
+        message: String,
+    },
+}
+
+/// Switch controller configuration
+#[derive(Clone, Debug)]
+pub struct SwitchConfig {
+    /// Seconds before boundary to start preparing next market (default: 60)
+    pub lead_time_secs: i64,
+    /// Minimum consecutive consistent resolutions required (default: 3)
+    pub min_consecutive: u32,
+    /// Seconds to keep old subscription after switching (default: 15)
+    pub overlap_secs: u64,
+    /// Polling interval in milliseconds (default: 2000)
+    pub poll_interval_ms: u64,
+}
+
+impl Default for SwitchConfig {
+    fn default() -> Self {
+        Self {
+            lead_time_secs: 60,
+            min_consecutive: 3,
+            overlap_secs: 15,
+            poll_interval_ms: 2000,
+        }
+    }
+}
+
+/// Switch controller statistics for observability
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct SwitchStats {
+    /// Total successful switches
+    pub switch_count: u64,
+    /// Total freeze events during prepare phase
+    pub freeze_count: u64,
+    /// Time in seconds that next was ready before boundary
+    pub last_ready_lead_secs: Option<i64>,
+    /// Last switch latency in milliseconds
+    pub last_switch_latency_ms: Option<u64>,
+}
+
+// ============================================================================
 // Statistics Tracking
 // ============================================================================
 
