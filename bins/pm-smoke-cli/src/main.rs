@@ -4,6 +4,7 @@
 //! - `market`: Subscribe to market channel and collect messages
 //! - `user`: Subscribe to user channel (requires credentials)
 //! - `rest`: Test REST API connectivity
+//! - `resolve`: Resolve current 15-minute market for trading
 //!
 //! # Usage
 //! ```bash
@@ -16,17 +17,24 @@
 //!
 //! # REST connectivity test
 //! pm_smoke rest --asset-id <ASSET_ID>
+//!
+//! # Resolve current BTC 15-minute market
+//! pm_smoke resolve --series btc15m
+//! pm_smoke resolve --series btc15m --out resolved.json
 //! ```
 
 use anyhow::Result;
+use chrono::{DateTime, Utc};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
+use polymarket_adapter::gamma::{MarketResolver, MarketSeries};
 use polymarket_adapter::httpws::{ApiCredentials, MarketWsClient, RestClient, UserWsClient};
-use polymarket_adapter::{CLOB_REST_BASE, CLOB_WSS_ENDPOINT};
+use polymarket_adapter::types::ResolveResult;
+use polymarket_adapter::{CLOB_REST_BASE, CLOB_WSS_ENDPOINT, GAMMA_API_BASE};
 
 #[derive(Parser)]
 #[command(name = "pm_smoke")]
@@ -83,6 +91,25 @@ enum Commands {
         #[arg(long)]
         asset_id: Option<String>,
     },
+
+    /// Resolve current 15-minute market for a series
+    Resolve {
+        /// Market series to resolve (btc15m, eth15m)
+        #[arg(long)]
+        series: String,
+
+        /// Reference time for resolution (ISO 8601, default: now)
+        #[arg(long)]
+        asof: Option<String>,
+
+        /// Output file for ResolvedMarket JSON (optional, defaults to stdout)
+        #[arg(long)]
+        out: Option<PathBuf>,
+
+        /// Skip CLOB price validation
+        #[arg(long, default_value = "false")]
+        skip_clob_check: bool,
+    },
 }
 
 #[tokio::main]
@@ -113,6 +140,9 @@ async fn main() -> Result<()> {
             run_user_smoke(market_id, out, limit, shutdown).await
         }
         Commands::Rest { asset_id } => run_rest_smoke(asset_id).await,
+        Commands::Resolve { series, asof, out, skip_clob_check } => {
+            run_resolve(series, asof, out, skip_clob_check).await
+        }
     }
 }
 
@@ -303,6 +333,100 @@ async fn run_rest_smoke(asset_id: Option<String>) -> Result<()> {
 
     info!("");
     info!("REST smoke test complete");
+
+    Ok(())
+}
+
+async fn run_resolve(
+    series: String,
+    asof: Option<String>,
+    out: Option<PathBuf>,
+    skip_clob_check: bool,
+) -> Result<()> {
+    info!("=== Market Resolver ===");
+    info!("Gamma API: {}", GAMMA_API_BASE);
+    info!("CLOB API: {}", CLOB_REST_BASE);
+    info!("Series: {}", series);
+    info!("");
+
+    // Parse series
+    let market_series = match MarketSeries::from_str(&series) {
+        Some(s) => s,
+        None => {
+            error!("Unknown series: {}. Supported: btc15m, eth15m", series);
+            anyhow::bail!("Unknown series: {}", series);
+        }
+    };
+
+    // Parse asof time
+    let asof_time: DateTime<Utc> = match asof {
+        Some(ref s) => {
+            DateTime::parse_from_rfc3339(s)
+                .map_err(|e| anyhow::anyhow!("Invalid asof time '{}': {}", s, e))?
+                .with_timezone(&Utc)
+        }
+        None => Utc::now(),
+    };
+
+    info!("Reference time (asof): {}", asof_time);
+    info!("CLOB validation: {}", if skip_clob_check { "disabled" } else { "enabled" });
+    info!("");
+
+    // Create resolver
+    let mut config = polymarket_adapter::gamma::resolver::ResolverConfig::default();
+    config.clob_validation = !skip_clob_check;
+
+    let resolver = MarketResolver::with_config(config)?;
+
+    // Resolve
+    info!("Resolving market...");
+    let result = resolver.resolve(&market_series, asof_time).await;
+
+    // Output result
+    let json_output = serde_json::to_string_pretty(&result)?;
+
+    match &result {
+        ResolveResult::Ok(market) => {
+            info!("");
+            info!("=== Resolution SUCCESS ===");
+            info!("Slug: {}", market.slug);
+            info!("Condition ID: {}", market.condition_id);
+            info!("CLOB Token IDs:");
+            info!("  [0] {}: {}", market.outcomes[0], market.clob_token_ids[0]);
+            info!("  [1] {}: {}", market.outcomes[1], market.clob_token_ids[1]);
+            info!("Start: {}", market.start_date);
+            info!("End: {}", market.end_date);
+            info!("Selection reason: {:?}", market.selection_reason);
+        }
+        ResolveResult::Freeze { reason, message, candidates } => {
+            warn!("");
+            warn!("=== Resolution FREEZE ===");
+            warn!("Reason: {:?}", reason);
+            warn!("Message: {}", message);
+            warn!("Candidates considered: {:?}", candidates);
+            warn!("");
+            warn!("DO NOT TRADE - Resolution failed");
+        }
+    }
+
+    // Write to file or stdout
+    if let Some(out_path) = out {
+        if let Some(parent) = out_path.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        tokio::fs::write(&out_path, &json_output).await?;
+        info!("");
+        info!("Output written to: {}", out_path.display());
+    } else {
+        // Print JSON to stdout
+        println!();
+        println!("{}", json_output);
+    }
+
+    // Return error if FREEZE
+    if !result.is_ok() {
+        anyhow::bail!("Market resolution failed - FREEZE");
+    }
 
     Ok(())
 }

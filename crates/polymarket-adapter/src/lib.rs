@@ -3,6 +3,7 @@
 //! Dual backend support:
 //! - `httpws`: Custom REST + WebSocket implementation
 //! - `rsclob`: Official rs-clob-client wrapper (requires feature flag)
+//! - `gamma`: Gamma API client for market discovery and resolution
 //!
 //! # Official Documentation
 //! - Endpoints: https://docs.polymarket.com/quickstart/reference/endpoints
@@ -10,6 +11,7 @@
 //! - Market Channel: https://docs.polymarket.com/developers/CLOB/websocket/market-channel
 //! - User Channel: https://docs.polymarket.com/developers/CLOB/websocket/user-channel
 //! - Authentication: https://docs.polymarket.com/developers/CLOB/authentication
+//! - Gamma Structure: https://docs.polymarket.com/developers/gamma-markets-api/gamma-structure
 
 pub mod types;
 
@@ -18,6 +20,9 @@ pub mod httpws;
 
 #[cfg(feature = "rsclob")]
 pub mod rsclob;
+
+#[cfg(feature = "httpws")]
+pub mod gamma;
 
 pub use types::*;
 

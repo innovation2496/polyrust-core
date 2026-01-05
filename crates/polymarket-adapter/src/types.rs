@@ -489,6 +489,186 @@ impl WsInboundMessage {
 }
 
 // ============================================================================
+// Gamma API Types
+// Source: https://docs.polymarket.com/developers/gamma-markets-api/gamma-structure
+// ============================================================================
+
+/// Gamma Market response from GET /markets or GET /markets/slug/{slug}
+/// Source: https://gamma-api.polymarket.com
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GammaMarket {
+    /// Unique market identifier
+    pub id: String,
+
+    /// URL-friendly market name
+    pub slug: String,
+
+    /// Market question/title
+    pub question: String,
+
+    /// Blockchain condition identifier (important for CLOB)
+    pub condition_id: String,
+
+    /// CLOB token IDs for each outcome (should be exactly 2 for binary markets)
+    #[serde(default)]
+    pub clob_token_ids: Vec<String>,
+
+    /// Outcome labels (e.g., ["Up", "Down"] or ["Yes", "No"])
+    #[serde(default)]
+    pub outcomes: Vec<String>,
+
+    /// Current outcome prices as decimal strings
+    #[serde(default)]
+    pub outcome_prices: Vec<String>,
+
+    /// Market start time (ISO 8601)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub start_date: Option<String>,
+
+    /// Market end time (ISO 8601)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub end_date: Option<String>,
+
+    /// Whether market is currently active
+    #[serde(default)]
+    pub active: bool,
+
+    /// Whether market is closed
+    #[serde(default)]
+    pub closed: bool,
+
+    /// Whether market is archived
+    #[serde(default)]
+    pub archived: bool,
+
+    /// Resolution source description
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resolution_source: Option<String>,
+
+    /// Market description
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+
+    /// Extra fields for forward compatibility
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
+}
+
+impl GammaMarket {
+    /// Check if this is a valid binary market with 2 token IDs
+    pub fn is_valid_binary(&self) -> bool {
+        self.clob_token_ids.len() == 2
+    }
+
+    /// Parse start_date as Unix timestamp (seconds)
+    pub fn start_timestamp(&self) -> Option<i64> {
+        self.start_date.as_ref().and_then(|s| {
+            chrono::DateTime::parse_from_rfc3339(s)
+                .ok()
+                .map(|dt| dt.timestamp())
+        })
+    }
+
+    /// Parse end_date as Unix timestamp (seconds)
+    pub fn end_timestamp(&self) -> Option<i64> {
+        self.end_date.as_ref().and_then(|s| {
+            chrono::DateTime::parse_from_rfc3339(s)
+                .ok()
+                .map(|dt| dt.timestamp())
+        })
+    }
+}
+
+// ============================================================================
+// Market Resolver Types
+// ============================================================================
+
+/// Selection reason for audit trail
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SelectionReason {
+    /// Unique match found in time window
+    UniqueMatchInWindow,
+    /// Multiple candidates found - FREEZE
+    AmbiguousCandidates,
+    /// No candidates found - FREEZE
+    NoCandidates,
+    /// CLOB price check failed - FREEZE
+    ClobPriceCheckFailed,
+    /// Gamma API error - FREEZE
+    GammaApiError,
+    /// Market validation failed - FREEZE
+    ValidationFailed,
+}
+
+/// Resolved market with all necessary trading information
+/// This is the frozen output structure for the Market Resolver
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ResolvedMarket {
+    /// Gamma market ID
+    pub gamma_market_id: String,
+
+    /// Blockchain condition ID (for CLOB operations)
+    pub condition_id: String,
+
+    /// CLOB token IDs [token_up, token_down] for binary markets
+    pub clob_token_ids: [String; 2],
+
+    /// Market slug (URL identifier)
+    pub slug: String,
+
+    /// Market question/title
+    pub question: String,
+
+    /// Market start time (ISO 8601)
+    pub start_date: String,
+
+    /// Market end time (ISO 8601)
+    pub end_date: String,
+
+    /// Timestamp when this resolution was made (Unix ms)
+    pub selected_at_ms: i64,
+
+    /// Why this market was selected (for audit)
+    pub selection_reason: SelectionReason,
+
+    /// Outcomes labels (typically ["Up", "Down"])
+    pub outcomes: [String; 2],
+}
+
+/// Result of market resolution attempt
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum ResolveResult {
+    /// Successfully resolved to a unique market
+    Ok(ResolvedMarket),
+
+    /// Resolution failed - FREEZE (do not trade)
+    Freeze {
+        reason: SelectionReason,
+        message: String,
+        /// Candidate slugs that were considered
+        candidates: Vec<String>,
+    },
+}
+
+impl ResolveResult {
+    /// Check if resolution was successful
+    pub fn is_ok(&self) -> bool {
+        matches!(self, ResolveResult::Ok(_))
+    }
+
+    /// Get the resolved market if successful
+    pub fn market(&self) -> Option<&ResolvedMarket> {
+        match self {
+            ResolveResult::Ok(m) => Some(m),
+            ResolveResult::Freeze { .. } => None,
+        }
+    }
+}
+
+// ============================================================================
 // Statistics Tracking
 // ============================================================================
 
